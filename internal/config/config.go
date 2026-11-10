@@ -1,0 +1,97 @@
+package config
+
+import (
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"strconv"
+	"time"
+)
+
+type Config struct {
+	GRPCAddr        string
+	HTTPAddr        string
+	Endpoint        string
+	QueueCapacity   int
+	Workers         int
+	BatchSize       int
+	MaxRequestBytes int
+	MaxRecords      int
+	MaxPendingBytes int
+	MaxAttempts     int
+	BatchWait       time.Duration
+	ExportTimeout   time.Duration
+	RetryInitial    time.Duration
+	RetryMax        time.Duration
+	ShutdownTimeout time.Duration
+	Pprof           bool
+}
+
+func Load() (Config, error) {
+	c := Config{
+		GRPCAddr: "127.0.0.1:4317", HTTPAddr: "127.0.0.1:8888",
+		Endpoint: "http://localhost:3100/otlp/v1/logs", QueueCapacity: 128,
+		Workers: 4, BatchSize: 8, MaxRequestBytes: 1 << 20, MaxRecords: 1000,
+		MaxPendingBytes: 64 << 20, MaxAttempts: 5, BatchWait: 200 * time.Millisecond,
+		ExportTimeout: 5 * time.Second, RetryInitial: 100 * time.Millisecond,
+		RetryMax: 2 * time.Second, ShutdownTimeout: 15 * time.Second,
+	}
+	for key, dst := range map[string]*string{
+		"GRPC_ADDR": &c.GRPCAddr, "HTTP_ADDR": &c.HTTPAddr, "EXPORT_ENDPOINT": &c.Endpoint,
+	} {
+		if value, ok := os.LookupEnv(key); ok {
+			*dst = value
+		}
+	}
+	for key, dst := range map[string]*int{
+		"QUEUE_CAPACITY": &c.QueueCapacity, "WORKERS": &c.Workers,
+		"BATCH_SIZE": &c.BatchSize, "MAX_REQUEST_BYTES": &c.MaxRequestBytes,
+		"MAX_RECORDS_PER_REQUEST": &c.MaxRecords, "MAX_PENDING_BYTES": &c.MaxPendingBytes,
+		"MAX_EXPORT_ATTEMPTS": &c.MaxAttempts,
+	} {
+		if value, ok := os.LookupEnv(key); ok {
+			n, err := strconv.Atoi(value)
+			if err != nil || n <= 0 {
+				return c, fmt.Errorf("%s must be a positive integer", key)
+			}
+			*dst = n
+		}
+	}
+	for key, dst := range map[string]*time.Duration{
+		"BATCH_WAIT": &c.BatchWait, "EXPORT_TIMEOUT": &c.ExportTimeout,
+		"RETRY_INITIAL": &c.RetryInitial, "RETRY_MAX": &c.RetryMax,
+		"SHUTDOWN_TIMEOUT": &c.ShutdownTimeout,
+	} {
+		if value, ok := os.LookupEnv(key); ok {
+			d, err := time.ParseDuration(value)
+			if err != nil || d <= 0 {
+				return c, fmt.Errorf("%s must be a positive duration", key)
+			}
+			*dst = d
+		}
+	}
+	if value, ok := os.LookupEnv("ENABLE_PPROF"); ok {
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			return c, fmt.Errorf("ENABLE_PPROF: %w", err)
+		}
+		c.Pprof = v
+	}
+	u, err := url.Parse(c.Endpoint)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.Fragment != "" {
+		return c, fmt.Errorf("EXPORT_ENDPOINT must be an absolute HTTP(S) logs URL")
+	}
+	for _, addr := range []string{c.GRPCAddr, c.HTTPAddr} {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return c, fmt.Errorf("invalid listener address %q: %w", addr, err)
+		}
+	}
+	if c.MaxPendingBytes < c.MaxRequestBytes {
+		return c, fmt.Errorf("MAX_PENDING_BYTES must be >= MAX_REQUEST_BYTES")
+	}
+	if c.RetryMax < c.RetryInitial {
+		return c, fmt.Errorf("RETRY_MAX must be >= RETRY_INITIAL")
+	}
+	return c, nil
+}

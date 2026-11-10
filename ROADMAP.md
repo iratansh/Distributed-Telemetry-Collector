@@ -29,7 +29,7 @@ deployment. Start with logs only.
 - Use the installed Go toolchain and Docker Desktop engine.
 - Keep runtime data and local secrets out of Git.
 
-### 1. Functional, in-memory collector
+### 1. Functional, in-memory collector — implemented
 
 1. Add a small configuration layer and a runnable `cmd/collector` entry point.
 2. Implement the OTLP/gRPC logs receiver with validation and admission limits.

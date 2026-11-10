@@ -1,0 +1,228 @@
+{
+  "uid": "telemetry-collector",
+  "title": "Telemetry Collector",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "tags": [
+    "telemetry"
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Accepted and exported logs / second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(collector_received_total[$__rate_interval])",
+          "legendFormat": "accepted"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(collector_exported_total[$__rate_interval])",
+          "legendFormat": "exported"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Queued requests and in-flight records",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "collector_queue_depth",
+          "legendFormat": "queued requests"
+        },
+        {
+          "refId": "B",
+          "expr": "collector_in_flight_records",
+          "legendFormat": "in-flight records"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Admitted protobuf bytes",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "collector_pending_bytes",
+          "legendFormat": "pending bytes"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Dropped logs and failed HTTP attempts",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (collector_dropped_total)",
+          "legendFormat": "dropped {{reason}}"
+        },
+        {
+          "refId": "B",
+          "expr": "collector_export_failures_total",
+          "legendFormat": "failed attempts"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "P95 ingest and export duration",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(collector_ingest_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "ingest"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(collector_export_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "export incl. retries"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Rejected requests and export retries",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (collector_rejected_requests_total)",
+          "legendFormat": "rejected {{reason}}"
+        },
+        {
+          "refId": "B",
+          "expr": "collector_export_retries_total",
+          "legendFormat": "retries"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Demo logs",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"telemetry-demo\"}"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "sortOrder": "Descending"
+      }
+    }
+  ]
+}
