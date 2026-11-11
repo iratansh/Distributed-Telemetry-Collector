@@ -69,10 +69,84 @@ make run
 make produce
 ```
 
-`make build` writes both executables under `bin/`. Enable local pprof endpoints
+`make build` writes the collector, producer, and load driver under `bin/`. Enable local pprof endpoints
 with `ENABLE_PPROF=true make run`; profile at
 `http://localhost:8888/debug/pprof/`. If Docker cannot reach its engine, check
 `docker context show` and select `docker context use desktop-linux`.
+
+## Load measurements
+
+`make load` runs the bounded OTLP/gRPC load driver against
+`localhost:4317`. It reports accepted events/second, successful request P50/P95/P99
+latency, `RESOURCE_EXHAUSTED` requests, and load-generator machine details as
+JSON. It also samples queue depth, pending bytes, Go goroutines/heap, and process
+resident memory from Prometheus every 50 ms. Set `-rate` to pace the offered
+event rate; zero sends as fast as the bounded worker pool allows. Use
+`-metrics-endpoint ''` to disable sampling. For example:
+
+```sh
+go run ./cmd/loadgen -endpoint localhost:4317 -events 20000 -batch 100 -workers 16 -payload-bytes 64 -rate 2000
+```
+
+The worker count and jobs channel are bounded. P99 is the OTLP request
+acknowledgement latency; throughput counts accepted log events. Record collector
+worker, queue, byte-budget, and WAL sync settings alongside each run.
+
+The recovery tool creates a temporary WAL with unacknowledged one-event
+requests, then reports WAL startup scan time and end-to-end in-process replay
+plus WAL checkpoint time. Seeding is excluded. The replay benchmark uses an
+immediate-success exporter, so it measures the collector queue/workers and WAL
+acknowledgements without network/backend latency:
+
+```sh
+make recovery
+go run ./cmd/recoverybench -events 10000 -sync-interval 2ms -sync-max-batch 32
+```
+
+On an Apple M2 Pro (darwin/arm64, Go 1.26.2, 10 CPUs, GOMAXPROCS=10), a 5-second
+run accepted 10,000 events offered at 2,000 events/sec: 2,017.9 accepted
+events/sec, 6.18 ms request P50, 7.49 ms P95, and 8.68 ms P99, with no
+rejected requests. It used 100 events/request, 16 load workers, 64 body
+bytes/event, and the collector defaults (4 export workers, queue capacity 128,
+WAL sync every 2 ms or 32 records). Across 100 Prometheus samples, maximum
+queue depth was 1 request, pending bytes 59,330, Go heap allocation 10.8 MB,
+goroutines 23, and process resident memory 43.4 MB. This is a local baseline,
+not a portable capacity claim.
+
+An unpaced 50,000-event burst on the final collector accepted 16,000 events
+and returned `RESOURCE_EXHAUSTED` for 340 requests, with no other RPC errors.
+This verifies the configured queue and byte limits return overload to senders
+rather than growing without bound. Treat burst throughput as a saturation
+observation, not sustained capacity.
+
+A 10,000-event recovery run seeded durable WAL records in a child process that
+exited without closing the WAL, then reopened it in the parent. WAL scan and
+reconstruction took 21.4 ms. Replaying all 10,000 through the collector's
+worker pool and writing WAL checkpoints took 1.64 seconds (6,084 events/sec)
+with an immediate-success test exporter, a 2 ms sync interval, and 32-record
+group sync. The pipeline writes the batch's checkpoint records together and
+waits for one sync. Real downstream delivery time depends on backend latency
+and retries.
+
+`make bench` runs the in-memory pipeline, pipeline-with-WAL, and grouped WAL
+append/ack Go benchmarks with allocation reporting. A 1-second run on the same
+Apple M2 Pro reported 1.75 µs/op for in-memory admission and 547 µs/op for
+pipeline admission with WAL. A WAL microbenchmark with eight concurrent
+appends measured 10.3 ms per append-plus-batched-checkpoint group, compared
+with 43.1 ms when checkpointing those eight records individually. Go
+microbenchmarks are not equivalent to end-to-end service throughput.
+
+Capture a CPU profile of the WAL-backed admission benchmark with:
+
+```sh
+go test -run='^$' -bench=BenchmarkPipelineAdmissionWithWAL -benchtime=3s -cpuprofile=/tmp/dtc-phase3-cpu.out ./internal/collector
+go tool pprof -top /tmp/dtc-phase3-cpu.out
+```
+
+The local profile's largest samples were system calls (33%), runtime condition
+waits (25%), and GC object scanning (11%). This points to synchronization and
+WAL I/O waits as the next profiling targets; it does not by itself establish a
+single application-level hotspot.
 
 ## Delivery and resource behavior
 
@@ -83,6 +157,8 @@ with `ENABLE_PPROF=true make run`; profile at
   disabled, acknowledged data can be lost on a host or power failure.
   A crash after downstream export but before the WAL acknowledgement can replay
   a request and create duplicates, so delivery is at-least-once, not exactly-once.
+  When one downstream batch succeeds, its WAL acknowledgement frames are
+  appended together and covered by one sync.
 - The queue bounds waiting requests. A separate byte budget covers queued and
   in-flight requests, including batching and retries. It measures encoded
   protobuf bytes, rather than Go heap usage; decoding, protobuf objects, and
@@ -147,18 +223,21 @@ it does not automatically pass arbitrary variables into the container.
 ## Kubernetes metrics
 
 Kubernetes collection is optional and disabled by default. When enabled, the
-collector lists pods and deployments through the Kubernetes API and publishes
-the snapshot on the existing Prometheus `/metrics` endpoint. It reports pod
+collector lists pods, deployments, and nodes through the Kubernetes API and
+publishes the snapshot on the existing Prometheus `/metrics` endpoint. It reports pod
 counts by namespace and phase, current cumulative restart counts per
 namespace/pod/container, and desired/ready/available/updated replicas by
-deployment.
+deployment, node Ready counts, and each node's allocatable CPU cores and memory
+bytes. Allocatable values describe schedulable capacity, not live CPU or memory
+usage.
 Collection success, duration, last-success time, and errors (including forbidden access and
 timeouts) are also exposed. A failed snapshot leaves the last good resource
 snapshot in place and does not stop log ingestion.
 
 The primary series are `collector_kubernetes_pods`,
 `collector_kubernetes_container_restarts`, and
-`collector_kubernetes_deployment_replicas`.
+`collector_kubernetes_deployment_replicas`, `collector_kubernetes_nodes`, and
+`collector_kubernetes_node_allocatable`.
 
 For local development with your current kubeconfig:
 
@@ -169,7 +248,8 @@ KUBERNETES_ENABLED=true KUBERNETES_NAMESPACE=default make run
 Set `KUBERNETES_KUBECONFIG=/path/to/config` to select a specific kubeconfig.
 When running inside Kubernetes, client-go uses the pod's service account. The
 sample [RBAC manifest](deploy/kubernetes/rbac.yaml) grants list access to pods
-and deployments in `default`; set `KUBERNETES_NAMESPACE=default`, deploy the
+and deployments in `default`, plus cluster-scoped list access to nodes; set
+`KUBERNETES_NAMESPACE=default`, deploy the
 collector with `serviceAccountName: telemetry-collector`, and adjust the
 manifest namespace if needed. An empty namespace requires equivalent
 cluster-scoped list permissions. No pod mutation permissions are needed.

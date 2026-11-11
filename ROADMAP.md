@@ -49,8 +49,8 @@ lose accepted work, and that limitation must be explicit.
 ### 2. Durability and recovery — implemented and verified
 
 1. Define a versioned WAL record format with length framing and checksums.
-2. Implement append, grouped synchronization, startup replay, and corrupt tail
-   handling. Each caller waits for a sync that includes its own record.
+2. Implement append, configured synchronization, startup replay, and corrupt
+   tail handling.
 3. Ensure the receiver acknowledges only after the configured durable append.
 4. Checkpoint successfully exported records; compact acknowledged history safely.
 5. Add bounded retries and graceful shutdown/restart behavior around replay.
@@ -60,17 +60,16 @@ is available for delivery after a forced process restart. Tests cover truncation
 corruption, replay, duplicate delivery windows, and shutdown. Delivery remains
 at-least-once, not exactly-once.
 
-### 2.5 Kubernetes metrics integration — implemented; live-cluster verification pending
+## Backlog
 
-- Add a receiver that uses the Kubernetes API to collect pod status, restart
-  counts, and deployment availability.
-- Publish metrics through the existing Prometheus endpoint and expose
-  authentication, namespace selection, scrape interval, and failure behavior.
-- Document RBAC requirements and provide a local deployment example.
-
-**Acceptance:** With a configured Kubernetes cluster, Prometheus can scrape the
-documented pod and deployment metrics, while authentication and API errors are
-observable and do not block log ingestion.
+- Group multiple WAL appends under one filesystem sync to reduce sync overhead,
+  while bounding the added acknowledgement delay and documenting the durability
+  tradeoff.
+- Add Kubernetes metrics collection to the Go telemetry collector. For example,
+  implement a receiver that uses the Kubernetes API to collect pod status,
+  restart counts, and deployment availability, then sends those metrics through
+  the existing telemetry pipeline. This demonstrates Kubernetes API
+  integration alongside the collector's reliability mechanisms.
 
 ### 3. Performance and resource limits
 

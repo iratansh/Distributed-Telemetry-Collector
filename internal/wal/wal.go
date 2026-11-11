@@ -226,20 +226,40 @@ func (w *Log) Append(req *logs.ExportLogsServiceRequest) (uint64, error) {
 }
 
 func (w *Log) Ack(seq uint64) error {
+	return w.AckBatch([]uint64{seq})
+}
+
+// AckBatch checkpoints a set of exported requests with one WAL sync. A
+// successful return means the acknowledgement frames are durable when sync is
+// enabled. Repeated or already-acknowledged sequences are ignored.
+func (w *Log) AckBatch(sequences []uint64) error {
 	w.mu.Lock()
 	if err := w.checkWritableLocked(); err != nil {
 		w.mu.Unlock()
 		return err
 	}
-	if _, ok := w.pending[seq]; !ok {
+	pending := make([]uint64, 0, len(sequences))
+	seen := make(map[uint64]struct{}, len(sequences))
+	for _, seq := range sequences {
+		if _, duplicate := seen[seq]; duplicate {
+			continue
+		}
+		seen[seq] = struct{}{}
+		if _, ok := w.pending[seq]; ok {
+			pending = append(pending, seq)
+		}
+	}
+	if len(pending) == 0 {
 		w.mu.Unlock()
 		return nil
 	}
 	w.ops.Add(1)
 	defer w.ops.Done()
-	if err := writeFrame(w.file, ackRecord, seq, nil); err != nil {
-		w.mu.Unlock()
-		return err
+	for _, seq := range pending {
+		if err := writeFrame(w.file, ackRecord, seq, nil); err != nil {
+			w.mu.Unlock()
+			return err
+		}
 	}
 	if w.syncWrites {
 		done := w.queueSyncLocked()
@@ -249,10 +269,14 @@ func (w *Log) Ack(seq uint64) error {
 		}
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		delete(w.pending, seq)
+		for _, seq := range pending {
+			delete(w.pending, seq)
+		}
 		return w.compactIfNeeded()
 	}
-	delete(w.pending, seq)
+	for _, seq := range pending {
+		delete(w.pending, seq)
+	}
 	err := w.compactIfNeeded()
 	w.mu.Unlock()
 	return err
@@ -466,4 +490,11 @@ func (w *Log) Close() error {
 	err := w.file.Close()
 	w.file = nil
 	return errors.Join(syncErr, err)
+}
+
+// SyncCount returns the number of group filesystem syncs performed since Open.
+func (w *Log) SyncCount() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.syncCount
 }

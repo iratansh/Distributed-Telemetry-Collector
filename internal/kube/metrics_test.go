@@ -13,6 +13,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -20,6 +21,7 @@ import (
 type fakeClient struct {
 	pods                *corev1.PodList
 	deployments         *appsv1.DeploymentList
+	nodes               *corev1.NodeList
 	podErr              error
 	deploymentErr       error
 	podNamespace        string
@@ -33,6 +35,12 @@ func (f *fakeClient) ListPods(_ context.Context, namespace string) (*corev1.PodL
 func (f *fakeClient) ListDeployments(_ context.Context, namespace string) (*appsv1.DeploymentList, error) {
 	f.deploymentNamespace = namespace
 	return f.deployments, f.deploymentErr
+}
+func (f *fakeClient) ListNodes(context.Context) (*corev1.NodeList, error) {
+	if f.nodes == nil {
+		return &corev1.NodeList{}, nil
+	}
+	return f.nodes, nil
 }
 
 func newTestSource(client ResourceClient) (*Source, *Metrics) {
@@ -49,6 +57,7 @@ func TestCollectPublishesKubernetesSnapshot(t *testing.T) {
 			{ObjectMeta: metav1.ObjectMeta{Namespace: "payments"}, Status: corev1.PodStatus{Phase: corev1.PodPending}},
 		}},
 		deployments: &appsv1.DeploymentList{Items: []appsv1.Deployment{{ObjectMeta: metav1.ObjectMeta{Namespace: "payments", Name: "api"}, Spec: appsv1.DeploymentSpec{Replicas: &desired}, Status: appsv1.DeploymentStatus{ReadyReplicas: 2, AvailableReplicas: 1, UpdatedReplicas: 2}}}},
+		nodes:       &corev1.NodeList{Items: []corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}, Allocatable: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("8Gi")}}}}},
 	}
 	source, metrics := newTestSource(client)
 	if err := source.Collect(context.Background()); err != nil {
@@ -74,6 +83,15 @@ func TestCollectPublishesKubernetesSnapshot(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.DeploymentReplicas.WithLabelValues("payments", "api", "available")); got != 1 {
 		t.Fatalf("available replicas=%v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.Nodes.WithLabelValues("true")); got != 1 {
+		t.Fatalf("ready nodes=%v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.NodeAllocatable.WithLabelValues("node-a", "cpu")); got != 4 {
+		t.Fatalf("allocatable CPU=%v cores, want 4", got)
+	}
+	if got := testutil.ToFloat64(metrics.NodeAllocatable.WithLabelValues("node-a", "memory")); got != 8*1024*1024*1024 {
+		t.Fatalf("allocatable memory=%v bytes, want 8 GiB", got)
 	}
 	if got := testutil.ToFloat64(metrics.Success); got != 1 {
 		t.Fatalf("collection success=%v, want 1", got)

@@ -314,6 +314,55 @@ func TestWALUnacknowledgedExportCanBeDeliveredAgain(t *testing.T) {
 	}
 }
 
+func TestConcurrentPipelineAdmissionsShareWALSync(t *testing.T) {
+	const batch = 8
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Workers, cfg.QueueCapacity, cfg.BatchSize = batch, batch, 1
+	w, replay, err := wal.OpenWithOptions(t.TempDir(), wal.Options{Sync: true, SyncInterval: time.Second, MaxSyncBatch: batch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewWithWAL(cfg, exportFunc(func(ctx context.Context, _ *logs.ExportLogsServiceRequest) (int64, error) {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}), NewMetrics(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)), w, replay)
+	start := make(chan struct{})
+	errs := make(chan error, batch)
+	var senders sync.WaitGroup
+	for range batch {
+		senders.Add(1)
+		go func() {
+			defer senders.Done()
+			<-start
+			_, err := p.Export(context.Background(), request())
+			errs <- err
+		}()
+	}
+	close(start)
+	senders.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	syncs := w.SyncCount()
+	if syncs != 1 {
+		t.Fatalf("pipeline caused %d WAL syncs for %d concurrent requests; want one group sync", syncs, batch)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := p.Shutdown(ctx); err == nil {
+		t.Fatal("expected blocked exports to be canceled at shutdown")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAcknowledgedRequestSurvivesForcedProcessRestart(t *testing.T) {
 	if os.Getenv("DTC_WAL_CRASH_HELPER") == "1" {
 		dir := os.Getenv("DTC_WAL_CRASH_DIR")

@@ -146,6 +146,39 @@ func TestAcknowledgedRecordsAreSkippedAndSequenceContinues(t *testing.T) {
 	}
 }
 
+func TestAckBatchUsesOneSyncAndClearsAllPendingRecords(t *testing.T) {
+	dir := t.TempDir()
+	w, _, err := OpenWithOptions(dir, Options{Sync: true, SyncInterval: 10 * time.Millisecond, MaxSyncBatch: 32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequences := make([]uint64, 3)
+	for i := range sequences {
+		sequences[i], err = w.Append(testRequest("batch ack"))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := w.SyncCount()
+	if err := w.AckBatch([]uint64{sequences[0], sequences[1], sequences[1], sequences[2], 999}); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.SyncCount() - before; got != 1 {
+		t.Fatalf("ack batch performed %d syncs, want 1", got)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w, replay, err := OpenWithOptions(dir, Options{Sync: true, SyncInterval: 10 * time.Millisecond, MaxSyncBatch: 32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if len(replay) != 0 {
+		t.Fatalf("recovered %d records after batch ack, want none", len(replay))
+	}
+}
+
 func TestFrameLengthMatchesEncodedRecord(t *testing.T) {
 	dir := t.TempDir()
 	w, _, err := Open(dir, false)

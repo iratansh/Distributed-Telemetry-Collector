@@ -22,6 +22,7 @@ import (
 type ResourceClient interface {
 	ListPods(context.Context, string) (*corev1.PodList, error)
 	ListDeployments(context.Context, string) (*appsv1.DeploymentList, error)
+	ListNodes(context.Context) (*corev1.NodeList, error)
 }
 
 type apiClient struct {
@@ -49,6 +50,21 @@ func (c apiClient) ListDeployments(ctx context.Context, namespace string) (*apps
 	opts := metav1.ListOptions{Limit: 500}
 	for {
 		page, err := c.apps.Deployments(namespace).List(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		result.Items = append(result.Items, page.Items...)
+		if page.Continue == "" {
+			return result, nil
+		}
+		opts.Continue = page.Continue
+	}
+}
+func (c apiClient) ListNodes(ctx context.Context) (*corev1.NodeList, error) {
+	result := &corev1.NodeList{}
+	opts := metav1.ListOptions{Limit: 500}
+	for {
+		page, err := c.core.Nodes().List(ctx, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -87,6 +103,8 @@ type Metrics struct {
 	Pods               *prometheus.GaugeVec
 	Restarts           *prometheus.GaugeVec
 	DeploymentReplicas *prometheus.GaugeVec
+	Nodes              *prometheus.GaugeVec
+	NodeAllocatable    *prometheus.GaugeVec
 }
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -99,8 +117,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		Pods:               prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "collector_kubernetes_pods", Help: "Current pod count by namespace and phase."}, []string{"namespace", "phase"}),
 		Restarts:           prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "collector_kubernetes_container_restarts", Help: "Current cumulative container restart count by namespace, pod, and container."}, []string{"namespace", "pod", "container"}),
 		DeploymentReplicas: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "collector_kubernetes_deployment_replicas", Help: "Deployment replica counts by namespace, deployment, and state."}, []string{"namespace", "deployment", "state"}),
+		Nodes:              prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "collector_kubernetes_nodes", Help: "Kubernetes node counts by Ready condition status."}, []string{"ready_status"}),
+		NodeAllocatable:    prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "collector_kubernetes_node_allocatable", Help: "Node allocatable CPU cores or memory bytes, as reported by Kubernetes."}, []string{"node", "resource"}),
 	}
-	reg.MustRegister(m.Enabled, m.Success, m.Errors, m.Duration, m.LastSuccess, m.Pods, m.Restarts, m.DeploymentReplicas)
+	reg.MustRegister(m.Enabled, m.Success, m.Errors, m.Duration, m.LastSuccess, m.Pods, m.Restarts, m.DeploymentReplicas, m.Nodes, m.NodeAllocatable)
 	return m
 }
 
@@ -157,6 +177,13 @@ func (s *Source) Collect(parent context.Context) error {
 		}
 		return s.collectionError("deployments", err, started)
 	}
+	nodes, err := s.client.ListNodes(ctx)
+	if err != nil {
+		if parent.Err() != nil {
+			return err
+		}
+		return s.collectionError("nodes", err, started)
+	}
 
 	podCounts := make(map[[2]string]float64)
 	restarts := make(map[[3]string]float64)
@@ -193,6 +220,39 @@ func (s *Source) Collect(parent context.Context) error {
 		for state, value := range values {
 			s.metrics.DeploymentReplicas.WithLabelValues(deployment.Namespace, deployment.Name, state).Set(value)
 		}
+	}
+	nodeStates := make(map[string]float64)
+	nodeAllocatable := make(map[[2]string]float64)
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		ready := "unknown"
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == corev1.NodeReady {
+				switch condition.Status {
+				case corev1.ConditionTrue:
+					ready = "true"
+				case corev1.ConditionFalse:
+					ready = "false"
+				default:
+					ready = "unknown"
+				}
+				break
+			}
+		}
+		nodeStates[ready]++
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			if quantity, ok := node.Status.Allocatable[name]; ok {
+				nodeAllocatable[[2]string{node.Name, string(name)}] = quantity.AsApproximateFloat64()
+			}
+		}
+	}
+	s.metrics.Nodes.Reset()
+	for status, count := range nodeStates {
+		s.metrics.Nodes.WithLabelValues(status).Set(count)
+	}
+	s.metrics.NodeAllocatable.Reset()
+	for labels, value := range nodeAllocatable {
+		s.metrics.NodeAllocatable.WithLabelValues(labels[0], labels[1]).Set(value)
 	}
 	s.metrics.Duration.Observe(time.Since(started).Seconds())
 	s.metrics.LastSuccess.Set(float64(time.Now().Unix()))

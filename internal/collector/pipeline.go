@@ -29,22 +29,24 @@ type item struct {
 
 type Pipeline struct {
 	logs.UnimplementedLogsServiceServer
-	cfg            config.Config
-	exporter       Exporter
-	wal            *wal.Log
-	metrics        *Metrics
-	log            *slog.Logger
-	queue          chan item
-	mu             sync.Mutex
-	accepting      bool
-	queueClosed    bool
-	stopping       bool
-	recoveryActive bool
-	pendingBytes   int
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
-	done           chan struct{}
+	cfg                config.Config
+	exporter           Exporter
+	wal                *wal.Log
+	metrics            *Metrics
+	log                *slog.Logger
+	queue              chan item
+	mu                 sync.Mutex
+	admissions         sync.WaitGroup
+	admissionsInFlight int
+	accepting          bool
+	queueClosed        bool
+	stopping           bool
+	recoveryActive     bool
+	pendingBytes       int
+	ctx                context.Context
+	cancel             context.CancelFunc
+	wg                 sync.WaitGroup
+	done               chan struct{}
 }
 
 func New(cfg config.Config, exporter Exporter, metrics *Metrics, logger *slog.Logger) *Pipeline {
@@ -64,12 +66,10 @@ func NewWithWAL(cfg config.Config, exporter Exporter, metrics *Metrics, logger *
 			defer func() {
 				p.mu.Lock()
 				p.recoveryActive = false
-				if p.stopping && !p.queueClosed {
-					close(p.queue)
-					p.queueClosed = true
-				} else if !p.stopping {
+				if !p.stopping {
 					p.accepting = true
 				}
+				p.closeQueueIfDrainedLocked()
 				p.mu.Unlock()
 			}()
 			for _, record := range replay {
@@ -152,38 +152,82 @@ func (p *Pipeline) Export(ctx context.Context, req *logs.ExportLogsServiceReques
 		return nil, p.reject("size", codes.InvalidArgument, "request exceeds configured byte limit")
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if !p.accepting {
+		p.mu.Unlock()
 		return nil, p.reject("shutdown", codes.Unavailable, "collector is draining")
 	}
 	if size > p.cfg.MaxPendingBytes-p.pendingBytes {
+		p.mu.Unlock()
 		return nil, p.saturated()
 	}
-	if len(p.queue) == cap(p.queue) {
+	if len(p.queue)+p.admissionsInFlight >= cap(p.queue) {
+		p.mu.Unlock()
 		return nil, p.saturated()
 	}
+	// Reserve byte and queue capacity before releasing the state lock. The
+	// reservation keeps concurrent appenders bounded while WAL syncs are shared.
+	p.pendingBytes += size
+	p.metrics.PendingBytes.Add(float64(size))
+	p.metrics.QueueDepth.Inc()
+	p.admissionsInFlight++
+	p.admissions.Add(1)
+	p.mu.Unlock()
+
 	// Persist before making the request visible to workers or acknowledging it.
 	var sequence uint64
 	if p.wal != nil {
 		var err error
 		sequence, err = p.wal.Append(req)
 		if err != nil {
+			p.finishAdmission(size, false)
+			p.admissions.Done()
 			return nil, p.reject("wal", codes.Unavailable, "durable append failed")
 		}
 	}
-	// Account before publishing: workers may receive immediately.
-	p.pendingBytes += size
-	p.metrics.PendingBytes.Add(float64(size))
-	p.metrics.QueueDepth.Inc()
+	if err := ctx.Err(); err != nil {
+		p.finishAdmission(size, false)
+		p.admissions.Done()
+		return nil, status.FromContextError(err).Err()
+	}
+	p.mu.Lock()
 	select {
 	case p.queue <- item{request: req, records: count, size: size, sequence: sequence}:
 		p.metrics.Received.Add(float64(count))
+		p.admissionsInFlight--
+		p.closeQueueIfDrainedLocked()
+		p.mu.Unlock()
+		p.admissions.Done()
 		return &logs.ExportLogsServiceResponse{}, nil
 	default:
-		p.pendingBytes -= size
-		p.metrics.PendingBytes.Sub(float64(size))
-		p.metrics.QueueDepth.Dec()
+		p.releaseReservationLocked(size)
+		p.admissionsInFlight--
+		p.closeQueueIfDrainedLocked()
+		p.mu.Unlock()
+		p.admissions.Done()
 		return nil, p.saturated()
+	}
+}
+
+func (p *Pipeline) finishAdmission(size int, published bool) {
+	p.mu.Lock()
+	if !published {
+		p.releaseReservationLocked(size)
+	}
+	p.admissionsInFlight--
+	p.closeQueueIfDrainedLocked()
+	p.mu.Unlock()
+}
+
+func (p *Pipeline) releaseReservationLocked(size int) {
+	p.pendingBytes -= size
+	p.metrics.PendingBytes.Sub(float64(size))
+	p.metrics.QueueDepth.Dec()
+}
+
+func (p *Pipeline) closeQueueIfDrainedLocked() {
+	if p.stopping && !p.recoveryActive && p.admissionsInFlight == 0 && !p.queueClosed {
+		close(p.queue)
+		p.queueClosed = true
 	}
 }
 
@@ -206,16 +250,16 @@ func (p *Pipeline) StopAdmission() {
 	defer p.mu.Unlock()
 	p.accepting = false
 	p.stopping = true
-	if !p.recoveryActive && !p.queueClosed {
-		close(p.queue)
-		p.queueClosed = true
-	}
+	p.closeQueueIfDrainedLocked()
 }
 
 // Shutdown drains accepted work until the deadline, then cancels exports and
 // records every remaining accepted record as dropped.
 func (p *Pipeline) Shutdown(ctx context.Context) error {
 	p.StopAdmission()
+	// No new admission can start after StopAdmission. Let any in-progress WAL
+	// group commit finish before draining workers or closing the queue.
+	p.admissions.Wait()
 	select {
 	case <-p.done:
 		p.cancel()
@@ -297,10 +341,8 @@ func (p *Pipeline) worker() {
 			p.log.Error("batch delivery failed", "records", records, "error", err)
 		} else {
 			if p.wal != nil {
-				for _, sequence := range sequences {
-					if err := p.wal.Ack(sequence); err != nil {
-						p.log.Error("WAL checkpoint failed; delivery may replay", "sequence", sequence, "error", err)
-					}
+				if err := p.wal.AckBatch(sequences); err != nil {
+					p.log.Error("WAL checkpoint failed; delivery may replay", "sequences", sequences, "error", err)
 				}
 			}
 			p.metrics.Exported.Add(float64(int64(records) - rejected))
