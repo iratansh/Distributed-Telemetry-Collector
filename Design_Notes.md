@@ -1,88 +1,150 @@
-Design Challenges:
+# Design notes
 
-* Backpressure: What happens when producers generate events faster than consumers can process them?
-* Durability: Can the service recover buffered events after an unexpected crash?
-* Concurrency: Can multiple workers process events safely without leaking goroutines?
-* Delivery guarantees: Can you provide at-least-once delivery, and how do you handle duplicates?
-* Performance: How do batch sizes and worker counts affect throughput, latency, and memory?
+## Project scope
 
-Workflow:
+This is a local-development Go collector for studying bounded ingestion,
+concurrency, durability, and at-least-once delivery. It is not intended to be
+deployed as a production service, and the repository does not include a
+production release or deployment pipeline.
 
-Application Logs / Producers -> Go Ingestion Service -> Bounded Queue + Worker Pool -> WAL / Disk Buffer
+## Data flows
 
-				    -> Exporter
+### Application logs
 
-Considerations:
-Rate limiting
+```text
+OTLP producer
+  -> OTLP/gRPC receiver and validation
+  -> WAL append and configured filesystem sync
+  -> bounded queue and worker pool
+  -> batched OTLP/HTTP export with bounded retries
+  -> Grafana Loki
+```
 
-Buffer size
+Prometheus scrapes the collector's `/metrics` endpoint. Grafana can display
+collector metrics and query logs stored in Loki.
 
-Durable Acknowledgement
+### Kubernetes state metrics
 
-Replay ordering
+The optional Kubernetes collector periodically lists pods, deployments, and
+nodes through the Kubernetes API. It updates Prometheus metrics at the same
+`/metrics` endpoint. This is a periodic state snapshot, not an OTLP log stream
+or a source of real-time events. The default collection interval is 30 seconds.
+Node allocatable CPU and memory describe schedulable capacity, not live usage.
 
-Retry Behavior
+The feature was exercised locally against a Minikube nginx Deployment. The
+collector process ran on the host using a kubeconfig; the collector itself is
+not deployed into the cluster.
 
-Technologies:
+## Design decisions and tradeoffs
 
-| Core service     | Go                          | Goroutines, channels, concurrency, networking, profiling |
-| ---------------- | --------------------------- | -------------------------------------------------------- |
-| Ingestion API    | gRPC                        | Efficient RPC and streaming support                      |
-| Serialization    | Protocol Buffers            | Compact, typed message representation                    |
-| Telemetry format | OpenTelemetry / OTLP        | Industry-standard interoperability                       |
-| Processing       | Custom Go worker pool       | Demonstrates concurrency and backpressure                |
-| Buffering        | Bounded Go channels / queue | Explicit memory limits and flow control                  |
-| Durability       | Custom append-only WAL      | Crash recovery, replay, storage correctness              |
-| Monitoring       | Prometheus                  | Throughput, latency, queue depth, failures               |
-| Visualization    | Grafana                     | Dashboards and operational diagnostics                   |
-| Log destination  | Grafana Loki                | Realistic downstream telemetry backend                   |
-| Deployment       | Docker Compose              | Reproducible local environment                           |
-| Benchmarking     | Go benchmarks + k6          | Performance measurement and load testing                 |
-| Testing          | Go testing + race detector  | Concurrency correctness and regression tests             |
+### OTLP/gRPC and Protobuf for ingestion
 
-My Solution:
+The receiver uses the standard OTLP logs service and generated Protobuf types.
+This lets standard telemetry producers send logs without a project-specific
+wire format. The tradeoff is that this implementation currently accepts logs;
+metrics and traces do not share the receiver's ingestion path.
 
-Ingestion receiver
+### Bounded queue and fixed worker pool
 
-Validation · Admission control · Request limits
+The queue, pending-byte budget, and worker count put explicit limits on work in
+memory and concurrent exports. When capacity is exhausted, the collector
+rejects new requests with `RESOURCE_EXHAUSTED` so the producer can retry. This
+protects memory at the cost of requiring producers to handle backpressure; a
+larger queue would absorb longer bursts but also increase memory use and
+potential wait time. Worker concurrency improves throughput, but separate
+workers can export batches out of order.
 
-Durable append-only log (WAL)
+### WAL before acknowledgement
 
-Append · Commit · Replay · Checkpoints
+The receiver writes accepted requests to the WAL before returning success. With
+`WAL_SYNC=true`, the receiver waits for filesystem synchronization, improving
+survival across process, host, or power failure at the cost of disk I/O latency.
+Group sync lets concurrent records share that I/O; the configured sync interval
+adds a small bounded wait in exchange for fewer sync operations. Disabling sync
+reduces acknowledgement latency but weakens durability.
 
-Bounded queue + worker pool
+The WAL stores data and checkpoints in one append-only file. This keeps startup
+recovery ordered and straightforward, while requiring compaction to reclaim
+acknowledged history. Checksums detect damaged frames; checkpoints record
+successful delivery. A checksum cannot replace a checkpoint because record
+integrity says nothing about whether Loki accepted the record.
 
-Batching · Backpressure · Retry scheduling
+### At-least-once delivery and bounded retries
 
-OTLP/HTTP exporter
+The collector checkpoints a batch only after a successful downstream response.
+If it stops after Loki accepts the batch but before the checkpoint is durable,
+the batch is sent again after restart. This duplicate window favors avoiding
+data loss over claiming exactly-once delivery. Retry limits and jitter help
+recover from transient errors while bounding retry time and avoiding unlimited
+retry load. Permanent failures and exhausted retries are counted as drops.
 
-Delivery · Timeouts · Retry with backoff
+### Kubernetes metrics are snapshots
 
-Grafana Loki
+The Kubernetes API collector lists object state on an interval and updates
+Prometheus gauges. Polling is simple and exposes current state without adding a
+streaming watch lifecycle, but changes can remain unseen until the next
+collection. The default interval is 30 seconds. These metrics describe cluster
+state; application logs continue through OTLP independently.
 
-Stores and indexes log metadata for querying
+### Prometheus scrape path for collector metrics
 
-Grafana dashboards
+The collector exposes its operational and Kubernetes metrics in Prometheus
+format for Prometheus to scrape. This keeps collector health, queue, resource,
+and Kubernetes state metrics separate from the log export path to Loki. It also
+means metric freshness depends on both the Kubernetes collection interval and
+Prometheus's scrape interval.
 
-Search logs and inspect collector health
+## WAL design and delivery semantics
 
-Limitations:
-Loki Docs state that the max log-line size is 256KB, the consumer must align with that
+The WAL is an append-only file containing framed data and acknowledgement
+records. Each frame includes a length, version, type, sequence number, payload,
+and checksum.
 
-WAL_SYNC=True: Collector writes the request and asks the OS to sync the file before acknowledging the request.
+- A checksum detects an incomplete or damaged frame. Recovery trusts the valid
+  prefix and truncates from the first malformed frame, since later bytes cannot
+  be safely interpreted as a continuous append-only log.
+- A checkpoint (acknowledgement) records that a request was successfully
+  exported. During recovery, data records without a matching checkpoint are
+  replayed. Checksums establish integrity; checkpoints establish delivery
+  progress.
+- With `WAL_SYNC=true`, the receiver acknowledges only after a filesystem sync
+  includes the new data record. Concurrent appends can share one group sync,
+  bounded by `WAL_SYNC_INTERVAL` and `WAL_SYNC_MAX_BATCH`.
+- After an export batch succeeds, its acknowledgement frames are appended
+  together and covered by one sync. This reduces checkpoint sync overhead.
+- If the downstream accepts a batch but the collector stops before its
+  checkpoint is durable, the batch may be replayed and duplicated. Delivery is
+  at least once, not exactly once.
+- With `WAL_SYNC=false`, an acknowledged append may be lost after a host or
+  power failure because the collector did not wait for filesystem durability.
 
-WAL_SYNC=False: Collector writes the request but doesn't wait for confirmation. Faster but less reliable, a machine or power failure could lose recent writes.
+## Bounds, retries, and concurrency
 
-Design Decisions:
+The collector reserves request queue capacity and an encoded-protobuf byte
+budget before appending to the WAL. The append happens outside the pipeline
+state lock so concurrent requests can participate in group sync. The fixed
+worker pool batches requests and exports them concurrently. When the queue or
+byte budget is full, new requests receive `RESOURCE_EXHAUSTED`; memory use does
+not grow without bound. The byte budget does not include Go object overhead.
 
-WAL writes: WAL uses a mutex so one request at a time appends its reocrds, and when sync is enabled, waits for that write's sync to finish before the next append can proceed. This can add latency especially when sync is on.  Requests can be handled concurrently in following parts of the collorector, and workers and export batches concurrently. It's the WAL append step that takes turns. Optimization I'm choosing: Group several appends under one sync, trading a small delay before acknowledging requests for fewer sync operations.
+HTTP transport errors and selected retryable status codes use bounded
+exponential backoff with jitter. `Retry-After` is honored up to the configured
+maximum. Permanent errors or exhausted retries are counted as dropped. A
+network timeout can leave the downstream result uncertain, so retrying may
+also produce duplicates.
 
-1 WAL Write File: This WAL write file will contian both request appends and request ACKS. At startup the collector scans the file, remembers each DATA record then removes that sequence from its recovery set when it sees a matching ACK. The ACK itself means that the downstream export succeeded for that request. The idea behind ACK is that it makes the entire process more reliable; if Loki accepts the request but before its ACK is safely written, the collector can replay it.
+## Local verification and performance
 
-At least once processing: In the scenario above, this will most likely lead to a duplicate. In the observability world, we follow the mindset of "avoid losing data". For exactly once processing this would come with high overhead.
+The test suite covers WAL corruption and truncation, forced process restarts,
+replay and checkpointing, retry behavior, queue saturation, partial success,
+and graceful or forced shutdown. `make race`, `make vet`, and the GitHub Actions
+workflow check concurrency and build correctness. The local Docker Compose
+smoke test verifies that sample logs reach Loki.
 
-Check-sums: This is implemented in the WAL layer of things; when the collector is started and the collector reads the write file. It does a checksum run through the file. This is for data validation. If for instance the collector shut down mid way through a write: case 1 - the checksum will have already been computed for the record and written to the log file so the checksum recomputes the checksum for the record sees that the two vals dont match and truncates this record to the end of the file since it can't tell exactly where the malformed record ends. case 2 - the checksum itself is partially written,  then the record is simply incomplete and the WAL reader can't read the full record body so it truncates the file at that record's start.
-
-Kubernetes API: This API exposes object state and doesn't push OTLP telemetry so it must be handled differently. I propose having the collector periodically list pods and deployments, and expose snapshot metrics at /metrics :8888 for Prometheus to scrape and store them. The tradeoff with this is that while it does work the metrics aren't in real-time? However these metrics are about K8 state and not logs: the collector periodically reads pod and deployment status and updates gauges. These aren't real-time events. 
-
-Checkpointing: Check-sums check whether the WAL record is intact, checkpointing is determing whether the requests have already been exported. Do not replay checkpointed requests during recovery. On recovery the collector while remove checkpointed records from its in-mem pending set. At-least-once edge case: if the downstream accepts a batch but the collector crashes before its checkpoint is durable, that batch may be replayed and delivered twice.
+On the documented Apple M2 Pro baseline, a paced local run accepted 10,000
+events at about 2,018 events/sec with an OTLP request P99 of 8.68 ms. A
+simulated unclean exit followed by replay and checkpointing recovered 10,000
+events in about 1.64 seconds using an immediate-success test exporter. These
+are machine-specific measurements; real backend latency and retries affect
+recovery delivery time. See `README.md` for settings and full measurement
+details.

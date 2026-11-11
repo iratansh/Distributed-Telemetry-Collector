@@ -9,6 +9,7 @@ produce:
 load:
 	go run ./cmd/loadgen
 build:
+	mkdir -p bin
 	go build -o bin/collector ./cmd/collector
 	go build -o bin/producer ./cmd/producer
 	go build -o bin/loadgen ./cmd/loadgen

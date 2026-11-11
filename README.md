@@ -70,8 +70,8 @@ make run
 make produce
 ```
 
-`make build` writes the collector, producer, and load driver under `bin/`. Enable local pprof endpoints
-with `ENABLE_PPROF=true make run`; profile at
+`make build` writes the collector, producer, load driver, and recovery benchmark
+under `bin/`. Enable local pprof endpoints with `ENABLE_PPROF=true make run`; profile at
 `http://localhost:8888/debug/pprof/`. If Docker cannot reach its engine, check
 `docker context show` and select `docker context use desktop-linux`.
 
@@ -94,8 +94,9 @@ acknowledgement latency; throughput counts accepted log events. Record collector
 worker, queue, byte-budget, and WAL sync settings alongside each run.
 
 The recovery tool creates a temporary WAL with unacknowledged one-event
-requests, then reports WAL startup scan time and end-to-end in-process replay
-plus WAL checkpoint time. Seeding is excluded. The replay benchmark uses an
+requests. A child process syncs the records and exits without closing the WAL;
+the parent then reports startup scan time and end-to-end in-process replay plus
+WAL checkpoint time. Seeding is excluded. The replay benchmark uses an
 immediate-success exporter, so it measures the collector queue/workers and WAL
 acknowledgements without network/backend latency:
 
