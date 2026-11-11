@@ -47,6 +47,8 @@ Technologies:
 My Solution:
 
 
+
+
 Ingestion receiver
 
 Validation · Admission control · Request limits
@@ -70,3 +72,8 @@ Stores and indexes log metadata for querying
 Grafana dashboards
 
 Search logs and inspect collector health
+
+
+
+Limitations:
+Loki Docs state that the max log-line size is 256KB, the consumer must align with that
