@@ -2,7 +2,8 @@
 
 A Go collector for OpenTelemetry logs, built to study concurrency, backpressure,
 and failure handling. It uses a custom write-ahead log (WAL) for crash recovery
-and at-least-once delivery.
+and at-least-once delivery. The project is intended for local development and
+testing; it does not include a production deployment or release pipeline.
 
 ```mermaid
 flowchart LR
@@ -246,29 +247,31 @@ KUBERNETES_ENABLED=true KUBERNETES_NAMESPACE=default make run
 ```
 
 Set `KUBERNETES_KUBECONFIG=/path/to/config` to select a specific kubeconfig.
-When running inside Kubernetes, client-go uses the pod's service account. The
-sample [RBAC manifest](deploy/kubernetes/rbac.yaml) grants list access to pods
-and deployments in `default`, plus cluster-scoped list access to nodes; set
-`KUBERNETES_NAMESPACE=default`, deploy the
-collector with `serviceAccountName: telemetry-collector`, and adjust the
-manifest namespace if needed. An empty namespace requires equivalent
-cluster-scoped list permissions. No pod mutation permissions are needed.
+The live integration check ran the collector locally against a Minikube cluster
+using the user's kubeconfig. The sample
+[RBAC manifest](deploy/kubernetes/rbac.yaml) documents read-only list
+permissions for pods, deployments, and nodes; it does not define a collector
+workload. No collector deployment is provided or planned for this project.
 
 ## Verification
 
 ```sh
+make fmt-check
 make test
 make race
 make vet
+go build ./...
 make smoke
 ```
 
-The smoke check requires Docker, curl, and Python 3. It starts the stack, sends
-20 logs with a unique service name, queries Loki until all 20 are present, and
-checks that the collector counted 20 successful exports.
-It leaves the stack running for inspection. Tests exercise saturation,
-in-flight admission limits, batching, partial success, retries, gRPC limits,
-and graceful/forced shutdown.
+The GitHub Actions workflow runs formatting, static analysis, race-enabled
+tests, and a build; it does not publish or deploy anything. The local smoke
+check is optional and requires Docker, curl, and Python 3. It starts the stack,
+sends 20 logs with a unique service name, queries Loki until all 20 are present,
+and checks that the collector counted 20 successful exports. It leaves the
+stack running for inspection. Tests also exercise WAL corruption and forced
+process restart, saturation, in-flight admission limits, batching, partial
+success, retries, gRPC limits, and graceful/forced shutdown.
 
 The OTLP transport and retry policy follow the
 [OTLP specification](https://opentelemetry.io/docs/specs/otlp/); Loki's setup

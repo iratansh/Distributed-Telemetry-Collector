@@ -1,4 +1,6 @@
-.PHONY: run produce load build fmt vet test race bench recovery up down smoke
+.PHONY: run produce load build fmt fmt-check vet test race bench recovery up down smoke
+
+GO_FILES := $(shell find cmd internal -type f -name '*.go')
 
 run:
 	go run ./cmd/collector
@@ -12,7 +14,13 @@ build:
 	go build -o bin/loadgen ./cmd/loadgen
 	go build -o bin/recoverybench ./cmd/recoverybench
 fmt:
-	gofmt -w cmd internal
+	gofmt -w $(GO_FILES)
+fmt-check:
+	@unformatted="$$(gofmt -l $(GO_FILES))"; \
+	if [ -n "$$unformatted" ]; then \
+		printf '%s\n' "$$unformatted"; \
+		exit 1; \
+	fi
 vet:
 	go vet ./...
 test:
