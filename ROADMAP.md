@@ -62,6 +62,9 @@ at-least-once, not exactly-once.
 
 ## Backlog
 
+- Group multiple WAL appends under one filesystem sync to reduce sync overhead,
+  while bounding the added acknowledgement delay and documenting the durability
+  tradeoff.
 - Add Kubernetes metrics collection to the Go telemetry collector. For example,
   implement a receiver that uses the Kubernetes API to collect pod status,
   restart counts, and deployment availability, then sends those metrics through
