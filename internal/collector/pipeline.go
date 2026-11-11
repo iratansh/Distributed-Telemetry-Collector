@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/iratansh/distributed-telemetry-collector/internal/config"
+	"github.com/iratansh/distributed-telemetry-collector/internal/wal"
 	logs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
@@ -23,33 +24,87 @@ type Exporter interface {
 type item struct {
 	request       *logs.ExportLogsServiceRequest
 	records, size int
+	sequence      uint64
 }
 
 type Pipeline struct {
 	logs.UnimplementedLogsServiceServer
-	cfg          config.Config
-	exporter     Exporter
-	metrics      *Metrics
-	log          *slog.Logger
-	queue        chan item
-	mu           sync.Mutex
-	accepting    bool
-	pendingBytes int
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	done         chan struct{}
+	cfg            config.Config
+	exporter       Exporter
+	wal            *wal.Log
+	metrics        *Metrics
+	log            *slog.Logger
+	queue          chan item
+	mu             sync.Mutex
+	accepting      bool
+	queueClosed    bool
+	stopping       bool
+	recoveryActive bool
+	pendingBytes   int
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	done           chan struct{}
 }
 
 func New(cfg config.Config, exporter Exporter, metrics *Metrics, logger *slog.Logger) *Pipeline {
+	return NewWithWAL(cfg, exporter, metrics, logger, nil, nil)
+}
+
+func NewWithWAL(cfg config.Config, exporter Exporter, metrics *Metrics, logger *slog.Logger, durable *wal.Log, replay []wal.Record) *Pipeline {
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &Pipeline{cfg: cfg, exporter: exporter, metrics: metrics, log: logger, queue: make(chan item, cfg.QueueCapacity), accepting: true, ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	p := &Pipeline{cfg: cfg, exporter: exporter, metrics: metrics, log: logger, wal: durable, queue: make(chan item, cfg.QueueCapacity), accepting: len(replay) == 0, recoveryActive: len(replay) > 0, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	for i := 0; i < cfg.Workers; i++ {
 		p.wg.Add(1)
 		go p.worker()
 	}
 	go func() { p.wg.Wait(); close(p.done) }()
+	if len(replay) > 0 {
+		go func() {
+			defer func() {
+				p.mu.Lock()
+				p.recoveryActive = false
+				if p.stopping && !p.queueClosed {
+					close(p.queue)
+					p.queueClosed = true
+				} else if !p.stopping {
+					p.accepting = true
+				}
+				p.mu.Unlock()
+			}()
+			for _, record := range replay {
+				size := proto.Size(record.Request)
+				count := logRecordCount(record.Request)
+				p.mu.Lock()
+				p.pendingBytes += size
+				p.metrics.PendingBytes.Add(float64(size))
+				p.metrics.QueueDepth.Inc()
+				p.mu.Unlock()
+				select {
+				case p.queue <- item{request: record.Request, records: count, size: size, sequence: record.Sequence}:
+				case <-p.ctx.Done():
+					return
+				}
+			}
+			p.log.Info("WAL recovery queued", "requests", len(replay))
+		}()
+	}
 	return p
+}
+
+func logRecordCount(req *logs.ExportLogsServiceRequest) int {
+	n := 0
+	for _, resource := range req.ResourceLogs {
+		if resource == nil {
+			continue
+		}
+		for _, scope := range resource.ScopeLogs {
+			if scope != nil {
+				n += len(scope.LogRecords)
+			}
+		}
+	}
+	return n
 }
 
 func (p *Pipeline) Ready() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.accepting }
@@ -104,12 +159,24 @@ func (p *Pipeline) Export(ctx context.Context, req *logs.ExportLogsServiceReques
 	if size > p.cfg.MaxPendingBytes-p.pendingBytes {
 		return nil, p.saturated()
 	}
+	if len(p.queue) == cap(p.queue) {
+		return nil, p.saturated()
+	}
+	// Persist before making the request visible to workers or acknowledging it.
+	var sequence uint64
+	if p.wal != nil {
+		var err error
+		sequence, err = p.wal.Append(req)
+		if err != nil {
+			return nil, p.reject("wal", codes.Unavailable, "durable append failed")
+		}
+	}
 	// Account before publishing: workers may receive immediately.
 	p.pendingBytes += size
 	p.metrics.PendingBytes.Add(float64(size))
 	p.metrics.QueueDepth.Inc()
 	select {
-	case p.queue <- item{request: req, records: count, size: size}:
+	case p.queue <- item{request: req, records: count, size: size, sequence: sequence}:
 		p.metrics.Received.Add(float64(count))
 		return &logs.ExportLogsServiceResponse{}, nil
 	default:
@@ -137,9 +204,11 @@ func (p *Pipeline) saturated() error {
 func (p *Pipeline) StopAdmission() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.accepting {
-		p.accepting = false
+	p.accepting = false
+	p.stopping = true
+	if !p.recoveryActive && !p.queueClosed {
 		close(p.queue)
+		p.queueClosed = true
 	}
 }
 
@@ -189,6 +258,7 @@ func (p *Pipeline) worker() {
 		p.metrics.QueueDepth.Dec()
 		batch := &logs.ExportLogsServiceRequest{ResourceLogs: append(first.request.ResourceLogs[:0:0], first.request.ResourceLogs...)}
 		records, size := first.records, first.size
+		sequences := []uint64{first.sequence}
 		p.metrics.InFlight.Add(float64(records))
 		timer := time.NewTimer(p.cfg.BatchWait)
 		collecting := true
@@ -208,6 +278,7 @@ func (p *Pipeline) worker() {
 				batch.ResourceLogs = append(batch.ResourceLogs, work.request.ResourceLogs...)
 				records += work.records
 				size += work.size
+				sequences = append(sequences, work.sequence)
 			}
 		}
 		timer.Stop()
@@ -225,6 +296,13 @@ func (p *Pipeline) worker() {
 			p.metrics.Dropped.WithLabelValues(reason).Add(float64(records))
 			p.log.Error("batch delivery failed", "records", records, "error", err)
 		} else {
+			if p.wal != nil {
+				for _, sequence := range sequences {
+					if err := p.wal.Ack(sequence); err != nil {
+						p.log.Error("WAL checkpoint failed; delivery may replay", "sequence", sequence, "error", err)
+					}
+				}
+			}
 			p.metrics.Exported.Add(float64(int64(records) - rejected))
 			if rejected > 0 {
 				p.metrics.Dropped.WithLabelValues("downstream_rejected").Add(float64(rejected))

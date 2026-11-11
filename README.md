@@ -1,13 +1,14 @@
 # Distributed Telemetry Collector
 
 A Go collector for OpenTelemetry logs, built to study concurrency, backpressure,
-and failure handling. Phase 1 runs as a single instance and uses memory for
-buffering. The next phase adds a custom write-ahead log and crash recovery.
+and failure handling. It uses a custom write-ahead log (WAL) for crash recovery
+and at-least-once delivery.
 
 ```mermaid
 flowchart LR
     P[OTLP producer] -->|gRPC :4317| R[Validation and admission]
-    R --> Q[Bounded queue]
+    R -->|WAL append and sync| D[(Persistent WAL)]
+    D --> Q[Bounded queue]
     Q --> W[Batching worker pool]
     W -->|OTLP/HTTP with retries| L[Loki]
     C[Collector metrics :8888] --> M[Prometheus]
@@ -75,8 +76,11 @@ with `ENABLE_PPROF=true make run`; profile at
 
 ## Delivery and resource behavior
 
-- A successful OTLP response means the request was admitted into memory. It
-  does not mean Loki has received it, and a crash can lose accepted logs.
+- A successful OTLP response means the request was appended to the WAL. With
+  `WAL_SYNC=true`, the collector synchronizes the append before acknowledging;
+  with it disabled, acknowledged data can be lost on a host or power failure.
+  A crash after downstream export but before the WAL acknowledgement can replay
+  a request and create duplicates, so delivery is at-least-once, not exactly-once.
 - The queue bounds waiting requests. A separate byte budget covers queued and
   in-flight requests, including batching and retries. It measures encoded
   protobuf bytes, rather than Go heap usage; decoding, protobuf objects, and
@@ -128,6 +132,8 @@ it does not automatically pass arbitrary variables into the container.
 | `RETRY_MAX` | `2s` | Maximum retry sleep |
 | `SHUTDOWN_TIMEOUT` | `15s` | Total gRPC shutdown and drain deadline |
 | `ENABLE_PPROF` | `false` | Enable pprof on the admin listener |
+| `WAL_DIR` | `./data/wal` | Directory containing the collector WAL |
+| `WAL_SYNC` | `true` | Synchronize every data and acknowledgement record before continuing |
 
 ## Verification
 

@@ -16,6 +16,7 @@ import (
 	"github.com/iratansh/distributed-telemetry-collector/internal/collector"
 	"github.com/iratansh/distributed-telemetry-collector/internal/config"
 	"github.com/iratansh/distributed-telemetry-collector/internal/exporter"
+	"github.com/iratansh/distributed-telemetry-collector/internal/wal"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -61,7 +62,12 @@ func run(logger *slog.Logger) error {
 		Attempts: cfg.MaxAttempts, Initial: cfg.RetryInitial, Max: cfg.RetryMax,
 		OnFailure: metrics.ExportFailures.Inc, OnRetry: metrics.Retries.Inc,
 	}
-	pipeline := collector.New(cfg, export, metrics, logger)
+	durable, replay, err := wal.Open(cfg.WALDir, cfg.WALSync)
+	if err != nil {
+		return err
+	}
+	defer durable.Close()
+	pipeline := collector.NewWithWAL(cfg, export, metrics, logger, durable, replay)
 	server := grpc.NewServer(grpc.MaxRecvMsgSize(cfg.MaxRequestBytes), grpc.MaxConcurrentStreams(64))
 	logs.RegisterLogsServiceServer(server, pipeline)
 	healthService := health.NewServer()
@@ -89,7 +95,7 @@ func run(logger *slog.Logger) error {
 	errs := make(chan error, 2)
 	go func() { errs <- server.Serve(grpcListener) }()
 	go func() { errs <- admin.Serve(httpListener) }()
-	logger.Info("collector ready", "grpc", grpcListener.Addr(), "http", httpListener.Addr(), "export_endpoint", cfg.Endpoint, "durable", false)
+	logger.Info("collector ready", "grpc", grpcListener.Addr(), "http", httpListener.Addr(), "export_endpoint", cfg.Endpoint, "wal_dir", cfg.WALDir, "wal_sync", cfg.WALSync)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var serveErr error
@@ -98,6 +104,9 @@ func run(logger *slog.Logger) error {
 	case serveErr = <-errs:
 	}
 	logger.Info("draining accepted logs", "timeout", cfg.ShutdownTimeout)
+	if !pipeline.Ready() {
+		logger.Info("WAL recovery is still being queued")
+	}
 	pipeline.StopAdmission()
 	healthService.Shutdown()
 	drainCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)

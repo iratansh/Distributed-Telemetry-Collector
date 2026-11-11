@@ -8,6 +8,10 @@ services:
       GRPC_ADDR: ":4317"
       HTTP_ADDR: ":8888"
       EXPORT_ENDPOINT: http://loki:3100/otlp/v1/logs
+      WAL_DIR: /data/wal
+      WAL_SYNC: "true"
+    volumes:
+      - collector-data:/data
     ports:
       - "127.0.0.1:${GRPC_PORT:-4317}:4317"
       - "127.0.0.1:${METRICS_PORT:-8888}:8888"
@@ -65,3 +69,4 @@ volumes:
   loki-data:
   prometheus-data:
   grafana-data:
+  collector-data:

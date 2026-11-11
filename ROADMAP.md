@@ -46,19 +46,27 @@ be queried in Loki. Queue saturation has a defined response, and graceful
 shutdown behavior is observable. This phase is in-memory; a process crash can
 lose accepted work, and that limitation must be explicit.
 
-### 2. Durability and recovery
+### 2. Durability and recovery — implementation complete; acceptance verification pending
 
 1. Define a versioned WAL record format with length framing and checksums.
 2. Implement append, configured synchronization, startup replay, and corrupt
    tail handling.
 3. Ensure the receiver acknowledges only after the configured durable append.
-4. Checkpoint successfully exported records; rotate and clean up segments safely.
+4. Checkpoint successfully exported records; compact acknowledged history safely.
 5. Add bounded retries and graceful shutdown/restart behavior around replay.
 
 **Acceptance:** Under the documented failure model, every acknowledged record
 is available for delivery after a forced process restart. Tests cover truncation,
 corruption, replay, duplicate delivery windows, and shutdown. Delivery remains
 at-least-once, not exactly-once.
+
+## Backlog
+
+- Add Kubernetes metrics collection to the Go telemetry collector. For example,
+  implement a receiver that uses the Kubernetes API to collect pod status,
+  restart counts, and deployment availability, then sends those metrics through
+  the existing telemetry pipeline. This demonstrates Kubernetes API
+  integration alongside the collector's reliability mechanisms.
 
 ### 3. Performance and resource limits
 

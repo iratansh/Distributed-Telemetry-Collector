@@ -26,6 +26,8 @@ type Config struct {
 	RetryMax        time.Duration
 	ShutdownTimeout time.Duration
 	Pprof           bool
+	WALDir          string
+	WALSync         bool
 }
 
 func Load() (Config, error) {
@@ -36,6 +38,7 @@ func Load() (Config, error) {
 		MaxPendingBytes: 64 << 20, MaxAttempts: 5, BatchWait: 200 * time.Millisecond,
 		ExportTimeout: 5 * time.Second, RetryInitial: 100 * time.Millisecond,
 		RetryMax: 2 * time.Second, ShutdownTimeout: 15 * time.Second,
+		WALDir: "./data/wal", WALSync: true,
 	}
 	for key, dst := range map[string]*string{
 		"GRPC_ADDR": &c.GRPCAddr, "HTTP_ADDR": &c.HTTPAddr, "EXPORT_ENDPOINT": &c.Endpoint,
@@ -77,6 +80,19 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("ENABLE_PPROF: %w", err)
 		}
 		c.Pprof = v
+	}
+	if value, ok := os.LookupEnv("WAL_DIR"); ok {
+		c.WALDir = value
+	}
+	if value, ok := os.LookupEnv("WAL_SYNC"); ok {
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			return c, fmt.Errorf("WAL_SYNC: %w", err)
+		}
+		c.WALSync = v
+	}
+	if c.WALDir == "" {
+		return c, fmt.Errorf("WAL_DIR must not be empty")
 	}
 	u, err := url.Parse(c.Endpoint)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.Fragment != "" {
