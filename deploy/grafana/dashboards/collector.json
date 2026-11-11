@@ -2,7 +2,7 @@
   "uid": "telemetry-collector",
   "title": "Telemetry Collector",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "5s",
   "time": {
     "from": "now-15m",
@@ -200,6 +200,119 @@
       ]
     },
     {
+      "id": 8,
+      "title": "Kubernetes pods by phase",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace, phase) (collector_kubernetes_pods)",
+          "legendFormat": "{{namespace}} / {{phase}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Kubernetes deployment replicas",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "collector_kubernetes_deployment_replicas{state=~\"desired|available\"}",
+          "legendFormat": "{{namespace}} / {{deployment}} {{state}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Kubernetes collection health",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "collector_kubernetes_collection_success",
+          "legendFormat": "last collection succeeded"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (reason) (rate(collector_kubernetes_collection_errors_total[$__rate_interval]))",
+          "legendFormat": "errors {{reason}} / second"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Kubernetes container restarts",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "collector_kubernetes_container_restarts",
+          "legendFormat": "{{namespace}} / {{pod}} / {{container}}"
+        }
+      ]
+    },
+    {
       "id": 7,
       "title": "Demo logs",
       "type": "logs",
@@ -209,7 +322,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 24,
+        "y": 40,
         "w": 24,
         "h": 10
       },

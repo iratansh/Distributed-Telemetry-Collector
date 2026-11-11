@@ -16,6 +16,7 @@ import (
 	"github.com/iratansh/distributed-telemetry-collector/internal/collector"
 	"github.com/iratansh/distributed-telemetry-collector/internal/config"
 	"github.com/iratansh/distributed-telemetry-collector/internal/exporter"
+	"github.com/iratansh/distributed-telemetry-collector/internal/kube"
 	"github.com/iratansh/distributed-telemetry-collector/internal/wal"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -53,6 +54,7 @@ func run(logger *slog.Logger) error {
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	metrics := collector.NewMetrics(registry)
+	kubeMetrics := kube.NewMetrics(registry)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConnsPerHost = cfg.Workers
 	defer transport.CloseIdleConnections()
@@ -62,7 +64,7 @@ func run(logger *slog.Logger) error {
 		Attempts: cfg.MaxAttempts, Initial: cfg.RetryInitial, Max: cfg.RetryMax,
 		OnFailure: metrics.ExportFailures.Inc, OnRetry: metrics.Retries.Inc,
 	}
-	durable, replay, err := wal.Open(cfg.WALDir, cfg.WALSync)
+	durable, replay, err := wal.OpenWithOptions(cfg.WALDir, wal.Options{Sync: cfg.WALSync, SyncInterval: cfg.WALSyncInterval, MaxSyncBatch: cfg.WALSyncMaxBatch})
 	if err != nil {
 		return err
 	}
@@ -92,16 +94,32 @@ func run(logger *slog.Logger) error {
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	}
 	admin := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	var kubeDone chan struct{}
+	if cfg.KubernetesEnabled {
+		client, err := kube.NewClient(cfg.KubernetesKubeconfig)
+		if err != nil {
+			kubeMetrics.RecordSetupError(err)
+			logger.Error("Kubernetes metrics source could not initialize; log ingestion remains available", "error", err)
+		} else {
+			source := kube.NewSource(client, cfg.KubernetesNamespace, cfg.KubernetesScrapeInterval, cfg.KubernetesRequestTimeout, kubeMetrics, logger)
+			kubeDone = make(chan struct{})
+			go func() { defer close(kubeDone); source.Run(ctx) }()
+		}
+	}
 	errs := make(chan error, 2)
 	go func() { errs <- server.Serve(grpcListener) }()
 	go func() { errs <- admin.Serve(httpListener) }()
-	logger.Info("collector ready", "grpc", grpcListener.Addr(), "http", httpListener.Addr(), "export_endpoint", cfg.Endpoint, "wal_dir", cfg.WALDir, "wal_sync", cfg.WALSync)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	logger.Info("collector ready", "grpc", grpcListener.Addr(), "http", httpListener.Addr(), "export_endpoint", cfg.Endpoint, "wal_dir", cfg.WALDir, "wal_sync", cfg.WALSync, "wal_sync_interval", cfg.WALSyncInterval, "wal_sync_max_batch", cfg.WALSyncMaxBatch, "kubernetes_enabled", cfg.KubernetesEnabled, "kubernetes_namespace", cfg.KubernetesNamespace)
 	var serveErr error
 	select {
 	case <-ctx.Done():
 	case serveErr = <-errs:
+	}
+	stop()
+	if kubeDone != nil {
+		<-kubeDone
 	}
 	logger.Info("draining accepted logs", "timeout", cfg.ShutdownTimeout)
 	if !pipeline.Ready() {

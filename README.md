@@ -77,8 +77,10 @@ with `ENABLE_PPROF=true make run`; profile at
 ## Delivery and resource behavior
 
 - A successful OTLP response means the request was appended to the WAL. With
-  `WAL_SYNC=true`, the collector synchronizes the append before acknowledging;
-  with it disabled, acknowledged data can be lost on a host or power failure.
+  `WAL_SYNC=true`, the collector waits for a filesystem sync that includes the
+  append before acknowledging. Concurrent WAL records can share a sync, with a
+  default maximum wait of 2 ms or until 32 records accumulate. With sync
+  disabled, acknowledged data can be lost on a host or power failure.
   A crash after downstream export but before the WAL acknowledgement can replay
   a request and create duplicates, so delivery is at-least-once, not exactly-once.
 - The queue bounds waiting requests. A separate byte budget covers queued and
@@ -133,7 +135,44 @@ it does not automatically pass arbitrary variables into the container.
 | `SHUTDOWN_TIMEOUT` | `15s` | Total gRPC shutdown and drain deadline |
 | `ENABLE_PPROF` | `false` | Enable pprof on the admin listener |
 | `WAL_DIR` | `./data/wal` | Directory containing the collector WAL |
-| `WAL_SYNC` | `true` | Synchronize every data and acknowledgement record before continuing |
+| `WAL_SYNC` | `true` | Wait for WAL data and acknowledgement records to be synchronized before continuing |
+| `WAL_SYNC_INTERVAL` | `2ms` | Maximum delay before syncing a group of WAL records; capped at `1s` |
+| `WAL_SYNC_MAX_BATCH` | `32` | WAL records that trigger an immediate group sync |
+| `KUBERNETES_ENABLED` | `false` | Enable periodic Kubernetes API collection |
+| `KUBERNETES_NAMESPACE` | empty | Namespace to collect; empty means all namespaces |
+| `KUBERNETES_KUBECONFIG` | empty | Kubeconfig path; empty uses in-cluster auth or client-go's default kubeconfig rules |
+| `KUBERNETES_SCRAPE_INTERVAL` | `30s` | Time between Kubernetes API snapshots |
+| `KUBERNETES_REQUEST_TIMEOUT` | `10s` | Deadline for listing pods and deployments per snapshot |
+
+## Kubernetes metrics
+
+Kubernetes collection is optional and disabled by default. When enabled, the
+collector lists pods and deployments through the Kubernetes API and publishes
+the snapshot on the existing Prometheus `/metrics` endpoint. It reports pod
+counts by namespace and phase, current cumulative restart counts per
+namespace/pod/container, and desired/ready/available/updated replicas by
+deployment.
+Collection success, duration, last-success time, and errors (including forbidden access and
+timeouts) are also exposed. A failed snapshot leaves the last good resource
+snapshot in place and does not stop log ingestion.
+
+The primary series are `collector_kubernetes_pods`,
+`collector_kubernetes_container_restarts`, and
+`collector_kubernetes_deployment_replicas`.
+
+For local development with your current kubeconfig:
+
+```sh
+KUBERNETES_ENABLED=true KUBERNETES_NAMESPACE=default make run
+```
+
+Set `KUBERNETES_KUBECONFIG=/path/to/config` to select a specific kubeconfig.
+When running inside Kubernetes, client-go uses the pod's service account. The
+sample [RBAC manifest](deploy/kubernetes/rbac.yaml) grants list access to pods
+and deployments in `default`; set `KUBERNETES_NAMESPACE=default`, deploy the
+collector with `serviceAccountName: telemetry-collector`, and adjust the
+manifest namespace if needed. An empty namespace requires equivalent
+cluster-scoped list permissions. No pod mutation permissions are needed.
 
 ## Verification
 

@@ -13,19 +13,29 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	logs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	"google.golang.org/protobuf/proto"
 )
 
 const (
-	headerSize            = 10 // version, kind, sequence
-	version               = 1
-	dataRecord       byte = 1
-	ackRecord        byte = 2
-	maxRecordSize         = 64 << 20
-	compactThreshold      = 64 << 20
+	headerSize         = 10 // version, kind, sequence
+	version            = 1
+	dataRecord    byte = 1
+	ackRecord     byte = 2
+	maxRecordSize      = 64 << 20
 )
+
+var compactThreshold int64 = 64 << 20
+
+const maxSyncInterval = time.Second
+
+type Options struct {
+	Sync         bool
+	SyncInterval time.Duration
+	MaxSyncBatch int
+}
 
 var checksumTable = crc32.MakeTable(crc32.Castagnoli)
 
@@ -35,15 +45,29 @@ type Record struct {
 }
 
 type Log struct {
-	mu         sync.Mutex
-	file       *os.File
-	path       string
-	syncWrites bool
-	next       uint64
-	pending    map[uint64]*logs.ExportLogsServiceRequest
+	mu           sync.Mutex
+	ops          sync.WaitGroup
+	file         *os.File
+	path         string
+	syncWrites   bool
+	syncInterval time.Duration
+	maxSyncBatch int
+	syncWaiters  []chan error
+	syncSignal   chan struct{}
+	syncStop     chan struct{}
+	syncDone     chan struct{}
+	closed       bool
+	fatal        error
+	syncCount    uint64
+	next         uint64
+	pending      map[uint64]*logs.ExportLogsServiceRequest
 }
 
 func Open(dir string, syncWrites bool) (*Log, []Record, error) {
+	return OpenWithOptions(dir, Options{Sync: syncWrites, SyncInterval: 2 * time.Millisecond, MaxSyncBatch: 32})
+}
+
+func OpenWithOptions(dir string, options Options) (*Log, []Record, error) {
 	if dir == "" {
 		return nil, nil, errors.New("WAL directory is required")
 	}
@@ -55,8 +79,20 @@ func Open(dir string, syncWrites bool) (*Log, []Record, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("open WAL: %w", err)
 	}
-	w := &Log{file: f, path: path, syncWrites: syncWrites, pending: make(map[uint64]*logs.ExportLogsServiceRequest)}
-	if syncWrites {
+	if options.Sync && options.SyncInterval <= 0 {
+		f.Close()
+		return nil, nil, errors.New("WAL sync interval must be positive")
+	}
+	if options.Sync && options.SyncInterval > maxSyncInterval {
+		f.Close()
+		return nil, nil, fmt.Errorf("WAL sync interval must be <= %s", maxSyncInterval)
+	}
+	if options.Sync && options.MaxSyncBatch <= 0 {
+		f.Close()
+		return nil, nil, errors.New("WAL sync batch must be positive")
+	}
+	w := &Log{file: f, path: path, syncWrites: options.Sync, syncInterval: options.SyncInterval, maxSyncBatch: options.MaxSyncBatch, pending: make(map[uint64]*logs.ExportLogsServiceRequest)}
+	if options.Sync {
 		d, err := os.Open(dir)
 		if err != nil {
 			f.Close()
@@ -72,6 +108,12 @@ func Open(dir string, syncWrites bool) (*Log, []Record, error) {
 	if err := w.recover(); err != nil {
 		f.Close()
 		return nil, nil, err
+	}
+	if options.Sync {
+		w.syncSignal = make(chan struct{}, 1)
+		w.syncStop = make(chan struct{})
+		w.syncDone = make(chan struct{})
+		go w.syncLoop()
 	}
 	replay := make([]Record, 0, len(w.pending))
 	for seq, req := range w.pending {
@@ -157,28 +199,152 @@ func (w *Log) Append(req *logs.ExportLogsServiceRequest) (uint64, error) {
 		return 0, err
 	}
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	if err := w.checkWritableLocked(); err != nil {
+		w.mu.Unlock()
+		return 0, err
+	}
+	w.ops.Add(1)
+	defer w.ops.Done()
 	seq := w.next
-	if err := w.write(dataRecord, seq, payload); err != nil {
+	if err := writeFrame(w.file, dataRecord, seq, payload); err != nil {
+		w.mu.Unlock()
 		return 0, err
 	}
 	w.next++
 	copyReq := proto.Clone(req).(*logs.ExportLogsServiceRequest)
 	w.pending[seq] = copyReq
+	if !w.syncWrites {
+		w.mu.Unlock()
+		return seq, nil
+	}
+	done := w.queueSyncLocked()
+	w.mu.Unlock()
+	if err := <-done; err != nil {
+		return 0, err
+	}
 	return seq, nil
 }
 
 func (w *Log) Ack(seq uint64) error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	if _, ok := w.pending[seq]; !ok {
-		return nil
-	}
-	if err := w.write(ackRecord, seq, nil); err != nil {
+	if err := w.checkWritableLocked(); err != nil {
+		w.mu.Unlock()
 		return err
 	}
+	if _, ok := w.pending[seq]; !ok {
+		w.mu.Unlock()
+		return nil
+	}
+	w.ops.Add(1)
+	defer w.ops.Done()
+	if err := writeFrame(w.file, ackRecord, seq, nil); err != nil {
+		w.mu.Unlock()
+		return err
+	}
+	if w.syncWrites {
+		done := w.queueSyncLocked()
+		w.mu.Unlock()
+		if err := <-done; err != nil {
+			return err
+		}
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		delete(w.pending, seq)
+		return w.compactIfNeeded()
+	}
 	delete(w.pending, seq)
-	return w.compactIfNeeded()
+	err := w.compactIfNeeded()
+	w.mu.Unlock()
+	return err
+}
+
+func (w *Log) checkWritableLocked() error {
+	if w.closed {
+		return errors.New("WAL is closed")
+	}
+	if w.fatal != nil {
+		return fmt.Errorf("WAL sync failed: %w", w.fatal)
+	}
+	return nil
+}
+
+func (w *Log) queueSyncLocked() <-chan error {
+	done := make(chan error, 1)
+	w.syncWaiters = append(w.syncWaiters, done)
+	select {
+	case w.syncSignal <- struct{}{}:
+	default:
+	}
+	return done
+}
+
+func (w *Log) syncLoop() {
+	defer close(w.syncDone)
+	for {
+		select {
+		case <-w.syncSignal:
+		case <-w.syncStop:
+			w.flushSyncWaiters()
+			return
+		}
+		w.mu.Lock()
+		ready := len(w.syncWaiters) >= w.maxSyncBatch
+		w.mu.Unlock()
+		if ready {
+			w.flushSyncWaiters()
+			continue
+		}
+		timer := time.NewTimer(w.syncInterval)
+		flush := false
+		for !flush {
+			select {
+			case <-timer.C:
+				flush = true
+			case <-w.syncSignal:
+				w.mu.Lock()
+				count := len(w.syncWaiters)
+				w.mu.Unlock()
+				if count >= w.maxSyncBatch {
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					flush = true
+				}
+			case <-w.syncStop:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				w.flushSyncWaiters()
+				return
+			}
+		}
+		w.flushSyncWaiters()
+	}
+}
+
+func (w *Log) flushSyncWaiters() {
+	w.mu.Lock()
+	waiters := w.syncWaiters
+	w.syncWaiters = nil
+	var err error
+	if len(waiters) > 0 {
+		err = w.file.Sync()
+		w.syncCount++
+		if err != nil && w.fatal == nil {
+			w.fatal = err
+		}
+	}
+	w.mu.Unlock()
+	for _, done := range waiters {
+		done <- err
+		close(done)
+	}
 }
 
 func (w *Log) compactIfNeeded() error {
@@ -230,8 +396,11 @@ func (w *Log) compactIfNeeded() error {
 	if err := w.file.Close(); err != nil {
 		return err
 	}
-	w.file, err = os.OpenFile(w.path, os.O_RDWR|os.O_APPEND, 0600)
+	w.file, err = os.OpenFile(w.path, os.O_RDWR, 0600)
 	if err != nil {
+		return err
+	}
+	if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
 		return err
 	}
 	if w.syncWrites {
@@ -242,24 +411,6 @@ func (w *Log) compactIfNeeded() error {
 		err = dir.Sync()
 		_ = dir.Close()
 		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (w *Log) write(kind byte, seq uint64, payload []byte) error {
-	start, err := w.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	if err := writeFrame(w.file, kind, seq, payload); err != nil {
-		return err
-	}
-	if w.syncWrites {
-		if err := w.file.Sync(); err != nil {
-			_ = w.file.Truncate(start)
-			_, _ = w.file.Seek(start, io.SeekStart)
 			return err
 		}
 	}
@@ -290,16 +441,29 @@ func writeFrame(file *os.File, kind byte, seq uint64, payload []byte) error {
 
 func (w *Log) Close() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.file == nil {
+		w.mu.Unlock()
 		return nil
 	}
+	w.closed = true
+	w.mu.Unlock()
+	w.ops.Wait()
 	if w.syncWrites {
-		if err := w.file.Sync(); err != nil {
-			return err
+		close(w.syncStop)
+		<-w.syncDone
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var syncErr error
+	if w.syncWrites {
+		syncErr = w.fatal
+	}
+	if w.syncWrites {
+		if err := w.file.Sync(); syncErr == nil {
+			syncErr = err
 		}
 	}
 	err := w.file.Close()
 	w.file = nil
-	return err
+	return errors.Join(syncErr, err)
 }

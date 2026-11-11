@@ -5,11 +5,15 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/iratansh/distributed-telemetry-collector/internal/config"
+	"github.com/iratansh/distributed-telemetry-collector/internal/wal"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	logs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
@@ -208,5 +212,170 @@ func TestGRPCProtocolAndValidation(t *testing.T) {
 	large.ResourceLogs[0].ScopeLogs[0].LogRecords[0].Body = &common.AnyValue{Value: &common.AnyValue_BytesValue{BytesValue: make([]byte, 2048)}}
 	if _, err := client.Export(ctx, large); status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("gRPC size limit not enforced: %v", err)
+	}
+}
+
+func TestWALReplaysAfterForcedShutdownThenCheckpoints(t *testing.T) {
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Workers, cfg.QueueCapacity, cfg.BatchSize = 1, 1, 1
+	dir := t.TempDir()
+	w, replay, err := wal.Open(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstExport := make(chan struct{})
+	p := NewWithWAL(cfg, exportFunc(func(ctx context.Context, _ *logs.ExportLogsServiceRequest) (int64, error) {
+		close(firstExport)
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}), NewMetrics(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)), w, replay)
+	if _, err := p.Export(context.Background(), request()); err != nil {
+		t.Fatal(err)
+	}
+	<-firstExport
+	deadline, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	err = p.Shutdown(deadline)
+	cancel()
+	if err == nil {
+		t.Fatal("expected forced shutdown deadline")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w, replay, err = wal.Open(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay) != 1 {
+		t.Fatalf("recovered %d requests, want the unacknowledged request", len(replay))
+	}
+	delivered := make(chan struct{})
+	p = NewWithWAL(cfg, exportFunc(func(context.Context, *logs.ExportLogsServiceRequest) (int64, error) {
+		close(delivered)
+		return 0, nil
+	}), NewMetrics(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)), w, replay)
+	<-delivered
+	ctx, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	if err := p.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w, replay, err = wal.Open(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if len(replay) != 0 {
+		t.Fatalf("replayed %d already acknowledged requests", len(replay))
+	}
+}
+
+func TestWALUnacknowledgedExportCanBeDeliveredAgain(t *testing.T) {
+	dir := t.TempDir()
+	w, _, err := wal.Open(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append(request()); err != nil {
+		t.Fatal(err)
+	}
+	// Model a crash after the downstream accepted the request but before the
+	// collector wrote its WAL acknowledgement.
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w, replay, err := wal.Open(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay) != 1 {
+		t.Fatalf("replay count=%d, want 1 for at-least-once delivery", len(replay))
+	}
+	if err := w.Ack(replay[0].Sequence); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, replay, err = wal.Open(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay) != 0 {
+		t.Fatalf("acknowledged request replayed %d times", len(replay))
+	}
+}
+
+func TestAcknowledgedRequestSurvivesForcedProcessRestart(t *testing.T) {
+	if os.Getenv("DTC_WAL_CRASH_HELPER") == "1" {
+		dir := os.Getenv("DTC_WAL_CRASH_DIR")
+		w, replay, err := wal.Open(dir, true)
+		if err != nil {
+			os.Exit(10)
+		}
+		cfg, err := config.Load()
+		if err != nil {
+			os.Exit(11)
+		}
+		p := NewWithWAL(cfg, exportFunc(func(ctx context.Context, _ *logs.ExportLogsServiceRequest) (int64, error) {
+			<-ctx.Done()
+			return 0, ctx.Err()
+		}), NewMetrics(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)), w, replay)
+		if _, err := p.Export(context.Background(), request()); err != nil {
+			os.Exit(12)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "accepted"), []byte("ok"), 0600); err != nil {
+			os.Exit(13)
+		}
+		select {} // parent kills the process after observing the acknowledged append
+	}
+
+	dir := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAcknowledgedRequestSurvivesForcedProcessRestart$")
+	cmd.Env = append(os.Environ(), "DTC_WAL_CRASH_HELPER=1", "DTC_WAL_CRASH_DIR="+dir)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	marker := filepath.Join(dir, "accepted")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		select {
+		case err := <-wait:
+			t.Fatalf("helper exited before acknowledging request: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			<-wait
+			t.Fatal("helper did not acknowledge request")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-wait; err == nil {
+		t.Fatal("expected helper to be killed")
+	}
+	w, replay, err := wal.Open(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if len(replay) != 1 {
+		t.Fatalf("recovered %d requests after forced process kill; want 1", len(replay))
 	}
 }
