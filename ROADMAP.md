@@ -81,12 +81,12 @@ latency.
   calls, runtime condition waits, and GC scanning.
 
 **Local baseline:** Apple M2 Pro, darwin/arm64, Go 1.26.2, 10 CPUs,
-GOMAXPROCS=10. A paced 10,000-event run at 2,000 offered events/sec accepted
-all events at 2,017.9 events/sec, with request P50/P95/P99 of 6.18/7.49/8.68
-ms. Across 100 Prometheus samples, maximum queue depth was 1, pending bytes
-59,330, Go heap 10.8 MB, process RSS 43.4 MB, and goroutines 23. A separate
-unpaced 50,000-event burst accepted 16,000 events and rejected 340 requests
-with `RESOURCE_EXHAUSTED`.
+GOMAXPROCS=10. A paced 60-second run accepted 120,000 events at 2,001.5
+events/sec, with request P50/P95/P99 of 5.91/9.99/17.28 ms. All records were
+exported and pending work drained to zero. Across 1,200 Prometheus samples,
+maximum queue depth was 1, pending bytes 95,728, Go heap 15.5 MB, process RSS
+47.2 MB, and goroutines 28. A separate unpaced 50,000-event burst accepted
+16,000 events and rejected 340 requests with `RESOURCE_EXHAUSTED`.
 
 After an unclean child-process exit, a 10,000-event WAL scan and reconstruction
 took 21.4 ms. Replay and checkpointing all 10,000 events took 1.64 seconds

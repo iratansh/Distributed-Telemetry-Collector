@@ -141,10 +141,11 @@ and graceful or forced shutdown. `make race`, `make vet`, and the GitHub Actions
 workflow check concurrency and build correctness. The local Docker Compose
 smoke test verifies that sample logs reach Loki.
 
-On the documented Apple M2 Pro baseline, a paced local run accepted 10,000
-events at about 2,018 events/sec with an OTLP request P99 of 8.68 ms. A
-simulated unclean exit followed by replay and checkpointing recovered 10,000
-events in about 1.64 seconds using an immediate-success test exporter. These
-are machine-specific measurements; real backend latency and retries affect
+On the documented Apple M2 Pro baseline, a 60-second paced local run accepted
+120,000 events at about 2,002 events/sec with an OTLP request P99 of 17.28 ms.
+All events were exported and pending work drained to zero. A simulated unclean
+exit followed by replay and checkpointing recovered 10,000 events in about
+1.64 seconds using an immediate-success test exporter. These are
+machine-specific measurements; real backend latency and retries affect
 recovery delivery time. See `README.md` for settings and full measurement
 details.

@@ -100,20 +100,28 @@ WAL checkpoint time. Seeding is excluded. The replay benchmark uses an
 immediate-success exporter, so it measures the collector queue/workers and WAL
 acknowledgements without network/backend latency:
 
+Each seeded request contains exactly one log event. Therefore `-events 10000`
+means 10,000 WAL data records, 10,000 requests, and 10,000 events; it does not
+mean 10,000 requests containing 100 events each. The scan timer covers WAL
+opening, frame validation, Protobuf decoding, and construction of the pending
+replay list. The replay timer additionally covers export through the worker
+pool and durable checkpointing.
+
 ```sh
 make recovery
 go run ./cmd/recoverybench -events 10000 -sync-interval 2ms -sync-max-batch 32
 ```
 
-On an Apple M2 Pro (darwin/arm64, Go 1.26.2, 10 CPUs, GOMAXPROCS=10), a 5-second
-run accepted 10,000 events offered at 2,000 events/sec: 2,017.9 accepted
-events/sec, 6.18 ms request P50, 7.49 ms P95, and 8.68 ms P99, with no
-rejected requests. It used 100 events/request, 16 load workers, 64 body
-bytes/event, and the collector defaults (4 export workers, queue capacity 128,
-WAL sync every 2 ms or 32 records). Across 100 Prometheus samples, maximum
-queue depth was 1 request, pending bytes 59,330, Go heap allocation 10.8 MB,
-goroutines 23, and process resident memory 43.4 MB. This is a local baseline,
-not a portable capacity claim.
+On an Apple M2 Pro (darwin/arm64, Go 1.26.2, 10 CPUs, GOMAXPROCS=10), a
+60-second run accepted 120,000 events offered at 2,000 events/sec: 2,001.5
+accepted events/sec, 5.91 ms request P50, 9.99 ms P95, and 17.28 ms P99, with
+no rejected requests or RPC errors. All 120,000 records were subsequently
+exported, and pending work drained to zero. It used 100 events/request, 16
+load workers, 64 body bytes/event, and the collector defaults (4 export
+workers, queue capacity 128, WAL sync every 2 ms or 32 records). Across 1,200
+Prometheus samples, maximum queue depth was 1 request, pending bytes 95,728,
+Go heap allocation 15.5 MB, goroutines 28, and process resident memory 47.2 MB.
+This is a local baseline, not a portable capacity claim.
 
 An unpaced 50,000-event burst on the final collector accepted 16,000 events
 and returned `RESOURCE_EXHAUSTED` for 340 requests, with no other RPC errors.
